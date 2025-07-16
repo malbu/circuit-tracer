@@ -1,5 +1,6 @@
 import argparse, math, pathlib, random, time, os, json, logging
 from pathlib import Path
+import safetensors.torch as st  
 
 import numpy as np
 import torch
@@ -10,6 +11,9 @@ from tqdm import tqdm
 
 from circuit_tracer.transcoder.single_layer_transcoder import SingleLayerTranscoder
 from circuit_tracer.transcoder.activation_functions import JumpReLU
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -85,7 +89,7 @@ def initialise_transcoder(d_model: int, d_trans: int, layer: int) -> SingleLayer
         layer_idx=layer,
         skip_connection=True,
     )
-    trans.cuda()
+    trans.to(DEVICE)
     return trans
 
 
@@ -114,7 +118,7 @@ def train_transcoder_for_layer(
     for step, batch_ids in enumerate(tqdm(data, desc=f"Layer {layer}", total=n_steps)):
         if step >= n_steps:
             break
-        batch_ids = batch_ids.cuda()
+        batch_ids = batch_ids.to(DEVICE)
         acts = sample_activations(model, layer, batch_ids)  # (B,T,D)
         flat = acts.reshape(-1, d_model)  # treat every position as example
         enc = transcoder.encode(flat)
@@ -127,18 +131,39 @@ def train_transcoder_for_layer(
         opt.step()
 
         if save_every > 0 and (step + 1) % save_every == 0:
-            # checkpoint intermediate weights
-            ckpt_path = Path(out_dir) / f"layer{layer}_step{step+1}.npz"
+            # save both NPZ *and* Safetensors
+            base = Path(out_dir) / f"layer{layer}_step{step+1}"
+
+            # 1) legacy .npz (unchanged)
             np.savez(
-                ckpt_path,
-                W_enc=transcoder.W_enc.cpu().numpy(),
-                W_dec=transcoder.W_dec.cpu().numpy(),
-                b_enc=transcoder.b_enc.cpu().numpy(),
-                b_dec=transcoder.b_dec.cpu().numpy(),
-                W_skip=transcoder.W_skip.cpu().numpy()
-                if transcoder.W_skip is not None
-                else None,
-                threshold=transcoder.activation_function.threshold.cpu().numpy(),
+                base.with_suffix(".npz"),
+                W_enc=transcoder.W_enc.detach().cpu().numpy(),
+                W_dec=transcoder.W_dec.detach().cpu().numpy(),
+                b_enc=transcoder.b_enc.detach().cpu().numpy(),
+                b_dec=transcoder.b_dec.detach().cpu().numpy(),
+                W_skip=(
+                    None
+                    if transcoder.W_skip is None
+                    else transcoder.W_skip.detach().cpu().numpy()
+                ),
+                # threshold is a buffer, keep it out of the strict state-dict
+            )
+
+            # 2) modern .safetensors
+            st.save_file(
+                {
+                    "W_enc": transcoder.W_enc.detach().cpu(),
+                    "W_dec": transcoder.W_dec.detach().cpu(),
+                    "b_enc": transcoder.b_enc.detach().cpu(),
+                    "b_dec": transcoder.b_dec.detach().cpu(),
+                    "W_skip": (
+                        transcoder.W_skip.detach().cpu()
+                        if transcoder.W_skip is not None
+                        else torch.zeros(1)
+                    ),
+                    # threshold is a buffer, keep it out of the strict state-dict
+                },
+                str(base.with_suffix(".safetensors")),
             )
 
         if step % 50 == 0:
@@ -153,7 +178,7 @@ def train_transcoder_for_layer(
 
 
 def main():
-    p = argparse.ArgumentParser(description="train SAE transcoders for every layer of a GPT-2 model so that circuit-tracer can analyse it.")
+    p = argparse.ArgumentParser(description="train SAE transcoders for every layer of a GPT-2 model so that circuit-tracer can analyse it")
     p.add_argument("--model_dir", required=True, help="path to the fine-tuned GPT-2 dir")
     p.add_argument("--train_smiles", required=True, help="text file containing SMILES for activation sampling")
     p.add_argument("--out_dir", default="smiles_transcoders", help="dir to write .npz files & YAML registry")
@@ -171,7 +196,11 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     
-    model = GPT2LMHeadModel.from_pretrained(args.model_dir, torch_dtype=torch.float32).cuda().eval()
+    model = (
+        GPT2LMHeadModel.from_pretrained(args.model_dir, torch_dtype=torch.float32)
+        .to(DEVICE)
+        .eval()
+    )
     tokenizer = PreTrainedTokenizerFast.from_pretrained(args.model_dir)
 
     stream_dataset = SmilesStream(args.train_smiles, tokenizer)
@@ -196,25 +225,54 @@ def main():
             args.save_every,
             args.out_dir,
         )
-        path = Path(args.out_dir) / f"layer{layer}.npz"
+        base = Path(args.out_dir) / f"layer{layer}"
+
+        # ---------- 1) final NPZ ----------
         np.savez(
-            path,
-            W_enc=transcoder.W_enc.cpu().numpy(),
-            W_dec=transcoder.W_dec.cpu().numpy(),
-            b_enc=transcoder.b_enc.cpu().numpy(),
-            b_dec=transcoder.b_dec.cpu().numpy(),
-            W_skip=transcoder.W_skip.cpu().numpy() if transcoder.W_skip is not None else None,
-            threshold=transcoder.activation_function.threshold.cpu().numpy(),
+            base.with_suffix(".npz"),
+            W_enc=transcoder.W_enc.detach().cpu().numpy(),
+            W_dec=transcoder.W_dec.detach().cpu().numpy(),
+            b_enc=transcoder.b_enc.detach().cpu().numpy(),
+            b_dec=transcoder.b_dec.detach().cpu().numpy(),
+            W_skip=(
+                None
+                if transcoder.W_skip is None
+                else transcoder.W_skip.detach().cpu().numpy()
+            ),
+            # threshold is a buffer, keep it out of the strict state-dict
         )
+
+        # ---------- 2) final SAFETENSORS ----------
+        st.save_file(
+            {
+                "W_enc": transcoder.W_enc.detach().cpu(),
+                "W_dec": transcoder.W_dec.detach().cpu(),
+                "b_enc": transcoder.b_enc.detach().cpu(),
+                "b_dec": transcoder.b_dec.detach().cpu(),
+                "W_skip": (
+                    transcoder.W_skip.detach().cpu()
+                    if transcoder.W_skip is not None
+                    else torch.zeros(1)
+                ),
+                # threshold is a buffer, keep it out of the strict state-dict
+            },
+            str(base.with_suffix(".safetensors")),
+        )
+
+        # point YAML to the safetensors file
         transcoders[layer] = {
             "layer": layer,
-            "filepath": str(path),
+            "filepath": str(base.with_suffix(".safetensors")),
+            "d_transcoder": args.d_transcoder,
             "id": f"smiles-l{layer}"
         }
 
     # write YAML registry 
     yaml_dict = {
         "model_name": args.model_dir,
+        # circuit-tracer expects this exact field name
+        "d_sae": args.d_transcoder,
+        "scan": False,
         "feature_input_hook": "mlp.hook_in",
         "feature_output_hook": "mlp.hook_out",
         "transcoders": list(transcoders.values()),

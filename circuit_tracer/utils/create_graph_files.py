@@ -193,10 +193,15 @@ def create_graph_files(
     used_nodes, used_edges = create_used_nodes_and_edges(graph, nodes, edge_mask)
     model = build_model(graph, used_nodes, used_edges, slug, scan, node_threshold, tokenizer)
 
-    # Write the output locally
+    # Write the pruned‑graph JSON
     with open(os.path.join(output_path, f"{slug}.json"), "w") as f:
         f.write(model.model_dump_json(indent=2))
-    add_graph_metadata(model.metadata.model_dump(), output_path)
+
+    
+    # Write / update the consolidated graph-metadata file expected by the
+    # frontend (dash, not underscore in the filename)
+    meta_path = os.path.join(output_path, "graph-metadata.json")
+    add_graph_metadata(model.metadata.model_dump(), meta_path)
     logger.info(f"Graph data written to {output_path}")
 
     total_time_ms = (time.time() - total_start_time) * 1000
