@@ -197,9 +197,9 @@ def create_graph_files(
     with open(os.path.join(output_path, f"{slug}.json"), "w") as f:
         f.write(model.model_dump_json(indent=2))
 
-    
+    # ----- NEW: write separate metadata file next to it -----
     # Write / update the consolidated graph-metadata file expected by the
-    # frontend (dash, not underscore in the filename)
+    # frontend (dash, not underscore in the filename).
     meta_path = os.path.join(output_path, "graph-metadata.json")
     add_graph_metadata(model.metadata.model_dump(), meta_path)
     logger.info(f"Graph data written to {output_path}")
